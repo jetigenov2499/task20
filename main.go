@@ -1,14 +1,30 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
-	"fmt"
+	"log"
 	"net/http"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	_ "github.com/lib/pq"
 )
+
+func connectToDatabase() (*sql.DB, error) {
+	db, err := sql.Open("postgres", "host=localhost port=5432 user=postgres dbname=dbec2 password=password sslmode=disable")
+	if err != nil {
+		return nil, err
+	}
+
+	if err = db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	return db, nil
+}
 
 func createEC2Instance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -37,9 +53,22 @@ func createEC2Instance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	instanceID := runResult.Instances[0].InstanceId
-	json.NewEncoder(w).Encode(struct{ InstanceID string }{InstanceID: *instanceID})
-	fmt.Fprintf(w, "Created instance %s", *instanceID)
+	instanceID := *runResult.Instances[0].InstanceId
+
+	db, err := connectToDatabase()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = db.Exec("INSERT INTO instances (instance_id) VALUES ($1)", instanceID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	defer db.Close()
+	json.NewEncoder(w).Encode(struct{ InstanceID string }{InstanceID: instanceID})
+
 }
 
 func terminateEC2Instance(w http.ResponseWriter, r *http.Request) {
@@ -49,8 +78,8 @@ func terminateEC2Instance(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 
 	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String("eu-north-1"),
-	})
+		Region: aws.String("eu-north-1")},
+	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -58,26 +87,86 @@ func terminateEC2Instance(w http.ResponseWriter, r *http.Request) {
 
 	svc := ec2.New(sess)
 
-	instanceID := r.FormValue("instance_id")
-	if instanceID == "" {
-		http.Error(w, "instance_id parameter is required", http.StatusBadRequest)
+	decoder := json.NewDecoder(r.Body)
+	var instanceID struct {
+		InstanceID string `json:"instanceId"`
+	}
+	err = decoder.Decode(&instanceID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	_, err = svc.TerminateInstances(&ec2.TerminateInstancesInput{
-		InstanceIds: []*string{aws.String(instanceID)},
-	})
+	input := &ec2.TerminateInstancesInput{
+		InstanceIds: []*string{aws.String(instanceID.InstanceID)},
+	}
+
+	result, err := svc.TerminateInstances(input)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Fprintf(w, "Terminated instance %s", instanceID)
+	db, err := connectToDatabase()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = db.Exec("DELETE FROM instances WHERE instance_id = $1", instanceID.InstanceID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := map[string]interface{}{
+		"terminated": len(result.TerminatingInstances) > 0,
+	}
+	defer db.Close()
+	json.NewEncoder(w).Encode(response)
+
+}
+
+func listEC2Instances(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("eu-north-1"),
+	})
+
+	if err != nil {
+		log.Println(err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	svc := ec2.New(sess)
+
+	result, err := svc.DescribeInstances(nil)
+	if err != nil {
+		log.Println(err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	instances := []string{}
+	for _, reservation := range result.Reservations {
+		for _, instance := range reservation.Instances {
+			instances = append(instances, *instance.InstanceId)
+		}
+	}
+
+	json.NewEncoder(w).Encode(instances)
 }
 
 func main() {
+
 	http.HandleFunc("/api/ec2/create", createEC2Instance)
 	http.HandleFunc("/api/ec2/terminate", terminateEC2Instance)
-	http.Handle("/", http.FileServer(http.Dir("./html/index.html")))
-	http.ListenAndServe(":8080", nil)
+	http.HandleFunc("/api/ec2/list", listEC2Instances)
+	http.Handle("/", http.FileServer(http.Dir("./html")))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+
 }
